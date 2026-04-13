@@ -76,16 +76,12 @@ function RedisBroker(conf) {
     self.redis = redis.createClient(conf.BROKER_OPTIONS);
 
     self.end = function() {
-        self.redis.end(true);
+        self.redis.destroy();
     };
 
     self.disconnect = function() {
         self.redis.quit();
     };
-
-    self.redis.on('connect', function() {
-        self.emit('ready');
-    });
 
     self.redis.on('error', function(err) {
         self.emit('error', err);
@@ -97,7 +93,7 @@ function RedisBroker(conf) {
 
     self.publish = function(queue, message, options, callback, id) {
         var payload = {
-            body: new Buffer(message).toString('base64'),
+            body: Buffer.from(message).toString('base64'),
             headers: {},
             'content-type': options.contentType,
             'content-encoding': options.contentEncoding,
@@ -114,8 +110,14 @@ function RedisBroker(conf) {
                 reply_to: uuid.v4()
             }
         };
-        self.redis.lpush(queue, JSON.stringify(payload));
+        self.redis.lPush(queue, JSON.stringify(payload));
     };
+
+    self.redis.connect().then(function() {
+        self.emit('ready');
+    }).catch(function(err) {
+        self.emit('error', err);
+    });
 
     return self;
 }
@@ -128,6 +130,10 @@ function RedisBackend(conf) {
     var backend_ex = self.redis.duplicate();
 
     self.redis.on('error', function(err) {
+        self.emit('error', err);
+    });
+
+    backend_ex.on('error', function(err) {
         self.emit('error', err);
     });
 
@@ -149,32 +155,40 @@ function RedisBackend(conf) {
     // result deserializer
     var parse = conf.RESULT_BACKEND_DESERIALIZER;
 
-    self.redis.on('connect', function() {
-        debug('Backend connected...');
-        // on redis result..
-        self.redis.on('pmessage', function(pattern, channel, data) {
-            backend_ex.expire(channel, conf.TASK_RESULT_EXPIRES / 1000);
-            var message = parse(data);
-            var taskid = channel.slice(key_prefix.length);
-            if (self.results.hasOwnProperty(taskid)) {
-                var res = self.results[taskid];
-                res.result = message;
-                res.emit('ready', res.result);
-                delete self.results[taskid];
-            } else {
-                // in case of incoming messages where we don't have the result object
-                self.emit('message', message);
-            }
-        });
-        // subscribe to redis results
-        self.redis.psubscribe(key_prefix + '*', () => {
+    backend_ex.connect()
+        .then(function() {
+            return self.redis.connect();
+        })
+        .then(function() {
+            debug('Backend connected...');
+            return self.redis.pSubscribe(key_prefix + '*', function(message, channel) {
+                backend_ex.expire(channel, conf.TASK_RESULT_EXPIRES / 1000);
+                var parsed = parse(message);
+                var taskid = channel.slice(key_prefix.length);
+                if (self.results.hasOwnProperty(taskid)) {
+                    var res = self.results[taskid];
+                    res.result = parsed;
+                    res.emit('ready', res.result);
+                    delete self.results[taskid];
+                } else {
+                    self.emit('message', parsed);
+                }
+            });
+        })
+        .then(function() {
             self.emit('ready');
+        })
+        .catch(function(err) {
+            self.emit('error', err);
         });
-    });
 
     self.get = function(taskid, cb) {
-        backend_ex.get(key_prefix + taskid, cb);
-    }
+        backend_ex.get(key_prefix + taskid).then(function(reply) {
+            cb(null, reply);
+        }).catch(function(err) {
+            cb(err);
+        });
+    };
 
     return self;
 }
